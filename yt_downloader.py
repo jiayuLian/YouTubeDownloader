@@ -128,18 +128,16 @@ def quality_to_format(quality):
     """把画质选项转成 yt-dlp 的 format 选择器。
 
     支持：
-      - 标准画质(1080/720)：有 1080 用 1080，没有就自动降 720/480（有哪个用哪个）
+      - 720p（默认）/ 1080p：按 height 过滤，有该档用该档，没有则自动降次档
       - 最佳画质 (best) / 仅音频 (mp3)：由 QUALITY_MAP 处理
-      - 动态档：解析视频后生成的 "1080p" / "720p" 等，按 height 过滤
+      - 动态档：解析视频后生成的其它 "1440p" / "2160p" 等，按 height 过滤
     """
     if quality == "最佳画质 (best)":
         return QUALITY_MAP["最佳画质 (best)"]
-    if quality == "标准画质(1080/720)":
-        return "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
     if re.fullmatch(r"\d+p", quality or ""):
         h = int(quality[:-1])
         return f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
-    return QUALITY_MAP.get(quality, QUALITY_MAP["最佳画质 (best)"])
+    return QUALITY_MAP.get(quality, "bestvideo[height<=720]+bestaudio/best[height<=720]")
 
 
 def build_opts(out_dir, quality, fragments, subs_langs, embed, only_audio, proxy=None, chunk_mb=0):
@@ -455,12 +453,12 @@ class App:
         )
         ttk.Button(f_opt, text="浏览", command=self._browse).grid(row=0, column=2)
 
-        # 画质 + 解析按钮
+        # 画质 + 解析按钮（默认 720p，可选 1080p；也可点解析画质拉真实清晰度）
         ttk.Label(f_opt, text="画质:").grid(row=1, column=0, sticky="w")
-        self.quality_var = tk.StringVar(value="标准画质(1080/720)")
+        self.quality_var = tk.StringVar(value="720p")
         self.quality_combo = ttk.Combobox(
             f_opt, textvariable=self.quality_var,
-            values=["标准画质(1080/720)", "最佳画质 (best)", "仅音频 (mp3)"],
+            values=["720p", "1080p", "最佳画质 (best)", "仅音频 (mp3)"],
             state="readonly", width=22
         )
         self.quality_combo.grid(row=1, column=1, sticky="w", padx=4)
@@ -619,13 +617,13 @@ class App:
         self.root.after(0, self._on_parsed, common, n)
 
     def _on_parsed(self, common, n):
-        options = ["标准画质(1080/720)", "最佳画质 (best)"]
+        options = ["720p", "1080p", "最佳画质 (best)"]
         for h in sorted(common):
             options.append(f"{h}p")
         options.append("仅音频 (mp3)")
         self.quality_combo["values"] = options
         if self.quality_var.get() not in options:
-            self.quality_var.set("标准画质(1080/720)")
+            self.quality_var.set("720p")
         self.parse_btn.config(state="normal")
         self.start_btn.config(state="normal")
         if len(options) > 3:
@@ -853,6 +851,11 @@ def main():
         if p:
             FFMPEG = p
     root = tk.Tk()
+    try:
+        # 窗口标题栏图标（桌面 exe 图标由 PyInstaller --icon 负责）
+        root.iconbitmap(resource_path("app.ico"))
+    except Exception:
+        pass
     App(root)
     root.mainloop()
 
