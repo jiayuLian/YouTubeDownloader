@@ -1,0 +1,5 @@
+# 每行一个 YouTube 视频/播放列表链接，保存后用程序里的“从 urls.txt 导入”加载
+# 例如：
+https://www.youtube.com/watch?v=XXXXXXXXXXX
+https://www.youtube.com/watch?v=YYYYYYYYYYY
+https://www.youtube.com/playlist?list=ZZZZZZZZZZZZ
