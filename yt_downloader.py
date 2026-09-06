@@ -11,6 +11,7 @@ import os
 import sys
 import re
 import glob
+import shutil
 import subprocess
 import threading
 import queue
@@ -140,7 +141,7 @@ def quality_to_format(quality):
     return QUALITY_MAP.get(quality, "bestvideo[height<=720]+bestaudio/best[height<=720]")
 
 
-def build_opts(out_dir, quality, fragments, subs_langs, embed, only_audio, proxy=None, chunk_mb=0):
+def build_opts(out_dir, quality, fragments, subs_langs, embed, only_audio, proxy=None, chunk_mb=0, hardsub=False):
     opts = {
         "outtmpl": os.path.join(out_dir, "%(title)s [%(id)s].%(ext)s"),
         "ffmpeg_location": FFMPEG,
@@ -178,12 +179,18 @@ def build_opts(out_dir, quality, fragments, subs_langs, embed, only_audio, proxy
         opts["format"] = quality_to_format(quality)
         opts["merge_output_format"] = "mkv"   # mkv 对字幕内嵌兼容性最好
         if embed and subs_langs:
-            # 只内嵌、不保留独立字幕文件：避免一个视频额外产出一堆 .srt/.vtt，
-            # 看起来像“重复视频”。embed 后 yt-dlp 会自动清理临时字幕。
-            opts["writeautomaticsub"] = True   # 允许嵌入自动生成字幕
-            opts["embedsubtitles"] = True
+            # 始终下载字幕（手动+自动）到磁盘，供后续封装/烧录使用
+            opts["writesubtitles"] = True
+            opts["writeautomaticsub"] = True
             opts["subtitlesformat"] = "srt/ass/vtt"
             opts["subtitleslangs"] = subs_langs
+            if hardsub:
+                # 硬字幕模式：把字幕烧录进画面，不额外加可选软轨道
+                # （避免播放器开了 CC 后出现“双字幕”）
+                opts["embedsubtitles"] = False
+            else:
+                # 软内嵌模式：字幕作为可选轨道，播放器需手动开 CC
+                opts["embedsubtitles"] = True
     return opts
 
 
@@ -225,7 +232,7 @@ def get_video_heights(url, proxy=None, max_entries=20):
 # ----------------------------------------------------------------------------
 # 单个视频下载
 # ----------------------------------------------------------------------------
-def download_one(url, base_opts, out_dir, subs_langs, idx, total, abort, status_cb):
+def download_one(url, base_opts, out_dir, subs_langs, hardsub, idx, total, abort, status_cb):
     """status_cb(idx, info_dict) —— info_dict: {state, pct, speed, eta, downloaded, total}"""
     if abort.is_set():
         status_cb(idx, {"state": "已取消", "pct": None})
@@ -251,10 +258,18 @@ def download_one(url, base_opts, out_dir, subs_langs, idx, total, abort, status_
         if log.failed:
             status_cb(idx, {"state": "失败", "pct": None})
             return
-        # 字幕嵌入兜底：yt-dlp 对“自动字幕”内嵌经常静默失败，会留下独立字幕文件。
-        # 这里检测残留的独立字幕，若有则用 ffmpeg 封装回视频并删除残留。
-        embedded = recover_embed_subtitles(captured, out_dir, subs_langs, idx)
-        state = "完成(已内嵌字幕)" if embedded else "完成"
+        if hardsub:
+            # 硬字幕：把字幕烧录进画面，任何播放器/手机都直接显示、关不掉
+            burned = burn_subtitles(captured, out_dir, subs_langs, idx)
+            if not burned:
+                # 烧录失败则退回软内嵌兜底（至少保证有字幕轨道）
+                recover_embed_subtitles(captured, out_dir, subs_langs, idx)
+            state = "完成(已烧录字幕)" if burned else "完成(已内嵌字幕)"
+        else:
+            # 软内嵌兜底：yt-dlp 对“自动字幕”内嵌经常静默失败，会留下独立字幕文件。
+            # 这里检测残留的独立字幕，若有则用 ffmpeg 封装回视频并删除残留。
+            embedded = recover_embed_subtitles(captured, out_dir, subs_langs, idx)
+            state = "完成(已内嵌字幕)" if embedded else "完成"
         status_cb(idx, {"state": state, "pct": 100})
     except DownloadCancelled:
         # 用户点了停止，本视频主动取消
@@ -406,6 +421,103 @@ def recover_embed_subtitles(captured, out_dir, subs_langs, idx):
         return False
 
 
+def burn_subtitles(captured, out_dir, subs_langs, idx):
+    """硬字幕：用 ffmpeg 把字幕烧录进视频画面，任何播放器打开即显示、关不掉。
+
+    优先用 yt-dlp 写出的独立字幕文件（writesubtitles=True 保证落盘）；
+    找不到独立文件时，从视频已有的内嵌字幕流抽取后再烧录。
+    返回是否成功烧录。
+    """
+    vid = captured.get("id")
+    # 1) 定位主视频文件
+    videos = []
+    if vid:
+        videos = glob.glob(os.path.join(out_dir, f"*{vid}*.mkv"))
+        if not videos:
+            videos = glob.glob(os.path.join(out_dir, f"*{vid}*.mp4"))
+    if not videos:
+        videos = glob.glob(os.path.join(out_dir, "*.mkv")) + \
+                 glob.glob(os.path.join(out_dir, "*.mp4"))
+    if not videos:
+        return False
+    video_path = max(videos, key=os.path.getmtime)  # 刚下完的最新文件
+
+    # 2) 找字幕源：先独立字幕文件，再内嵌字幕流
+    sub_src = None
+    subs = []
+    for ext in ("srt", "ass", "vtt"):
+        if vid:
+            subs += glob.glob(os.path.join(out_dir, f"*{vid}*.{ext}"))
+        else:
+            subs += glob.glob(os.path.join(out_dir, f"*.{ext}"))
+    if subs:
+        chosen = None
+        for lang in subs_langs:
+            for sf in subs:
+                if f".{lang}." in sf:
+                    chosen = sf
+                    break
+            if chosen:
+                break
+        if not chosen:
+            chosen = subs[0]
+        sub_src = chosen
+    elif _has_subtitle_stream(video_path):
+        # 从内嵌字幕流抽取为临时 srt 再烧录
+        tmp = os.path.join(out_dir, "_burn_sub.srt")
+        try:
+            subprocess.run(
+                [FFMPEG, "-y", "-i", video_path, "-map", "0:s:0", "-c:s", "srt", tmp],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+            )
+            sub_src = tmp
+        except Exception:
+            sub_src = None
+    if not sub_src or not os.path.exists(sub_src):
+        return False
+
+    # 3) 复制到简单临时名（避免 Windows 路径里的 : \ 在 subtitles 滤镜里转义出错）
+    tmp_sub = os.path.join(out_dir, "_burn_sub" + os.path.splitext(sub_src)[1])
+    try:
+        shutil.copy(sub_src, tmp_sub)
+    except OSError:
+        tmp_sub = sub_src
+    esc = os.path.abspath(tmp_sub).replace("\\", "\\\\").replace(":", "\\:")
+    base = os.path.splitext(video_path)[0]
+    out_path = base + ".hardsub.mkv"
+    cmd = [
+        FFMPEG, "-y", "-i", video_path,
+        "-vf", f"subtitles='{esc}'",
+        "-c:a", "copy", "-c:v", "libx264", "-crf", "20", "-preset", "veryfast",
+        out_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.replace(out_path, video_path)
+        # 清理所有独立字幕残片 + 临时文件
+        for sf in subs:
+            try:
+                os.remove(sf)
+            except OSError:
+                pass
+        for f in (sub_src, tmp_sub):
+            if os.path.abspath(f) != os.path.abspath(video_path):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+        log_queue.put(("log", f"[{idx}] 已烧录字幕进视频（硬字幕）：{os.path.basename(video_path)}"))
+        return True
+    except Exception as e:
+        log_queue.put(("log", f"[{idx}] 字幕烧录失败（保留原视频）：{e}"))
+        for f in (out_path, tmp_sub):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        return False
+
+
 # ----------------------------------------------------------------------------
 # 主界面
 # ----------------------------------------------------------------------------
@@ -476,11 +588,11 @@ class App:
             f_opt, text="仅下载音频(mp3)", variable=self.audio_var
         ).grid(row=2, column=0, columnspan=4, sticky="w")
 
-        # 字幕（默认中文，自动内嵌，无需手动选语言）
+        # 字幕（默认中文，烧录进画面，任何播放器打开即显示、关不掉）
         ttk.Label(f_opt, text="字幕:").grid(row=3, column=0, sticky="w")
-        self.embed_var = tk.BooleanVar(value=True)
+        self.hardsub_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            f_opt, text="下载并把字幕内嵌进视频（默认中文）", variable=self.embed_var
+            f_opt, text="把字幕烧录进视频（硬字幕，默认中文，关不掉）", variable=self.hardsub_var
         ).grid(row=3, column=1, columnspan=3, sticky="w")
 
         # 代理
@@ -662,7 +774,9 @@ class App:
         # 字幕语言固定中文优先，无需用户设置
         subs = DEFAULT_SUBTITLES
         only_audio = self.audio_var.get()
-        embed = self.embed_var.get() and not only_audio
+        # 硬字幕（烧录）默认开启；勾选且非纯音频时生效
+        hardsub = self.hardsub_var.get() and not only_audio
+        embed = hardsub  # embed 控制是否下载字幕到磁盘，供烧录/兜底内嵌使用
         proxy = self.proxy_var.get().strip() or None
         # 并发参数按视频数量自动设置，不暴露给用户手动调
         parallel, frag, chunk = self._auto_concurrency(len(urls))
@@ -679,6 +793,7 @@ class App:
             only_audio,
             proxy,
             chunk,
+            hardsub,
         )
 
         self.running = True
@@ -706,7 +821,7 @@ class App:
             with cf.ThreadPoolExecutor(max_workers=parallel) as ex:
                 futures = [
                     ex.submit(
-                        download_one, u, base_opts, out_dir, subs, i, self.total,
+                        download_one, u, base_opts, out_dir, subs, hardsub, i, self.total,
                         self.abort, status_cb
                     )
                     for i, u in enumerate(urls, 1)
