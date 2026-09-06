@@ -5,7 +5,9 @@ cd /d %~dp0
 
 venv\Scripts\pyinstaller.exe --onefile --windowed --name YouTubeDownloader ^
   --distpath pyout_1 --workpath pybuild_1 --specpath pybuild_1 ^
+  --icon "app.ico" ^
   --add-binary "ffmpeg.exe;." ^
+  --add-data "app.ico;." ^
   --collect-submodules yt_dlp ^
   yt_downloader.py
 
