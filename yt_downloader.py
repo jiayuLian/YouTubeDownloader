@@ -237,7 +237,7 @@ def download_one(url, base_opts, out_dir, subs_langs, hardsub, idx, total, abort
     if abort.is_set():
         status_cb(idx, {"state": "已取消", "pct": None})
         return
-    status_cb(idx, {"state": "下载中", "pct": None})
+    status_cb(idx, {"state": "解析中…", "pct": None})
 
     # 每个视频用独立的 TaskLogger，才能准确判断成功/失败
     log = TaskLogger(log_queue)
@@ -259,6 +259,7 @@ def download_one(url, base_opts, out_dir, subs_langs, hardsub, idx, total, abort
             status_cb(idx, {"state": "失败", "pct": None})
             return
         if hardsub:
+            status_cb(idx, {"state": "字幕烧录中…", "pct": None})
             # 硬字幕：把字幕烧录进画面，任何播放器/手机都直接显示、关不掉
             burned = burn_subtitles(captured, out_dir, subs_langs, idx)
             if not burned:
@@ -266,6 +267,7 @@ def download_one(url, base_opts, out_dir, subs_langs, hardsub, idx, total, abort
                 recover_embed_subtitles(captured, out_dir, subs_langs, idx)
             state = "完成(已烧录字幕)" if burned else "完成(已内嵌字幕)"
         else:
+            status_cb(idx, {"state": "字幕内嵌中…", "pct": None})
             # 软内嵌兜底：yt-dlp 对“自动字幕”内嵌经常静默失败，会留下独立字幕文件。
             # 这里检测残留的独立字幕，若有则用 ffmpeg 封装回视频并删除残留。
             embedded = recover_embed_subtitles(captured, out_dir, subs_langs, idx)
@@ -833,6 +835,8 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
         self.status_var.set(f"下载中 0/{self.total}")
         self._update_overall()
+        self._anim_tick = 0
+        self.root.after(400, self._animate)
 
     def _finish(self):
         self.running = False
@@ -878,6 +882,8 @@ class App:
     # ---- 进度渲染 ----
     def _fmt_line(self, idx, info, url=""):
         state = info.get("state", "")
+        if state.startswith("解析中"):
+            state = "解析中" + info.get("_dots", "…")
         pct = info.get("pct")
         sp = fmt_speed(info.get("speed") or 0)
         eta = fmt_eta(info.get("eta"))
@@ -927,14 +933,32 @@ class App:
             pct = 0
         self.progress["value"] = pct
         self.prog_label.config(text=f"{pct:.0f}%")
+        parsing = any(s.get("state", "").startswith("解析中") for s in self.task_stats.values())
         if self.running and sum_t > 0 and speed > 0:
             eta = (sum_t - sum_d) / speed
             self.status_var.set(
                 f"下载中 {self.done}/{self.total}  ·  {fmt_bytes(sum_d)}/{fmt_bytes(sum_t)}"
                 f"  ·  {fmt_speed(speed)}  ·  预计剩余 {fmt_eta(eta)}"
             )
+        elif self.running and parsing:
+            np = sum(1 for s in self.task_stats.values() if s.get("state", "").startswith("解析中"))
+            self.status_var.set(
+                f"解析中… 正在解析 {np}/{self.total} 个链接（这步要等十几秒，不是卡住）"
+            )
         elif self.running:
             self.status_var.set(f"下载中 {self.done}/{self.total}")
+
+    # ---- 解析阶段动画（循环省略号，消除“假死”观感）----
+    def _animate(self):
+        self._anim_tick = (self._anim_tick + 1) % 4
+        dots = ("", ".", "..", "…")[self._anim_tick]
+        parsing = [i for i, s in self.task_stats.items()
+                   if s.get("state", "").startswith("解析中")]
+        if parsing and self.running:
+            for i in parsing:
+                self.task_stats[i]["_dots"] = dots
+                self._set_status(i, self.task_stats[i])
+            self.root.after(400, self._animate)
 
     # ---- 队列轮询 ----
     def _poll(self):
